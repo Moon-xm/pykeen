@@ -9,7 +9,7 @@ score value is model-dependent, and usually it cannot be directly interpreted as
 from class_resolver import Resolver
 
 from .base import EntityRelationEmbeddingModel, Model, _OldAbstractModel
-from .multimodal import ComplExLiteral, DistMultLiteral, LiteralModel
+from .multimodal import ComplExLiteral, DistMultLiteral, LiteralModel, DistMultLiteralGated
 from .nbase import ERModel, _NewAbstractModel
 from .resolve import make_model, make_model_cls
 from .unimodal import (
@@ -62,6 +62,7 @@ __all__ = [
     'DistMA',
     'DistMult',
     'DistMultLiteral',
+    'DistMultLiteralGated',
     'ERMLP',
     'ERMLPE',
     'HolE',
