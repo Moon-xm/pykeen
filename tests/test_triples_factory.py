@@ -20,8 +20,8 @@ from pykeen.triples.splitting import (
     _tf_cleanup_randomized,
     get_absolute_split_sizes, normalize_ratios,
 )
-from pykeen.triples.triples_factory import INVERSE_SUFFIX, TRIPLES_DF_COLUMNS, _map_triples_elements_to_ids
-from pykeen.triples.utils import get_entities, get_relations, load_triples
+from pykeen.triples.triples_factory import INVERSE_SUFFIX, _map_triples_elements_to_ids
+from pykeen.triples.utils import TRIPLES_DF_COLUMNS, get_entities, get_relations, load_triples
 from tests.constants import RESOURCES
 
 triples = np.array(
@@ -31,7 +31,7 @@ triples = np.array(
         ['susan', 'likes', 'pizza'],
         ['peter', 'likes', 'susan'],
     ],
-    dtype=np.str,
+    dtype=str,
 )
 
 instance_mapped_triples = np.array(
@@ -59,7 +59,7 @@ numeric_triples = np.array(
         ['susan', '/lit/hasAge', '28'],
         ['susan', '/lit/hasHeight', '170'],
     ],
-    dtype=np.str,
+    dtype=str,
 )
 
 
@@ -76,7 +76,7 @@ class TestTriplesFactory(unittest.TestCase):
             ['e1', 'a.', 'e5'],
             ['e1', 'a', 'e2'],
         ]
-        t = np.array(t, dtype=np.str)
+        t = np.array(t, dtype=str)
         factory = TriplesFactory.from_labeled_triples(triples=t, create_inverse_triples=True)
         instances = factory.create_slcwa_instances()
         assert len(instances) == 4
@@ -91,7 +91,7 @@ class TestTriplesFactory(unittest.TestCase):
             ['e1', 'a', 'e2'],
             ['e1', 'a.', 'e5'],
         ]
-        t = np.array(t, dtype=np.str)
+        t = np.array(t, dtype=str)
         for create_inverse_triples in (False, True):
             with patch("pykeen.triples.triples_factory.logger.warning") as warning:
                 factory = TriplesFactory.from_labeled_triples(triples=t, create_inverse_triples=create_inverse_triples)

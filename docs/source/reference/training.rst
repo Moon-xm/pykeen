@@ -18,3 +18,15 @@ Base Classes
 ------------
 .. autoclass:: pykeen.training.TrainingLoop
    :members:
+
+Callbacks
+---------
+.. automodapi:: pykeen.training.callbacks
+    :no-heading:
+    :headings: ~~
+
+Learning Rate Schedulers
+------------------------
+.. automodapi:: pykeen.lr_schedulers
+    :no-heading:
+    :headings: ~~

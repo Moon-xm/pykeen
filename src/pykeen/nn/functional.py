@@ -11,14 +11,13 @@ and (batch_size, 1, 1, num_tails, ``*``), and return a score tensor of shape
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import numpy
 import torch
 from torch import nn
 
-from .compute_kernel import _complex_native_complex
+from .compute_kernel import _complex_native_complex, batched_dot
 from .sim import KG2E_SIMILARITIES
 from ..moves import irfft, rfft
 from ..typing import GaussianDistribution
@@ -31,6 +30,8 @@ __all__ = [
     'complex_interaction',
     'conve_interaction',
     'convkb_interaction',
+    'cross_e_interaction',
+    'dist_ma_interaction',
     'distmult_interaction',
     'ermlp_interaction',
     'ermlpe_interaction',
@@ -46,57 +47,12 @@ __all__ = [
     'structured_embedding_interaction',
     'transd_interaction',
     'transe_interaction',
+    'transf_interaction',
     'transh_interaction',
     'transr_interaction',
     'tucker_interaction',
     'unstructured_model_interaction',
 ]
-
-
-@dataclass
-class SizeInformation:
-    """Size information of generic score function."""
-
-    #: The batch size of the head representations.
-    bh: int
-
-    #: The number of head representations per batch
-    nh: int
-
-    #: The batch size of the relation representations.
-    br: int
-
-    #: The number of relation representations per batch
-    nr: int
-
-    #: The batch size of the tail representations.
-    bt: int
-
-    #: The number of tail representations per batch
-    nt: int
-
-    @property
-    def same(self) -> bool:
-        """Whether all representations have the same shape."""
-        return (
-            self.bh == self.br
-            and self.bh == self.bt
-            and self.nh == self.nr
-            and self.nh == self.nt
-        )
-
-    @classmethod
-    def extract(
-        cls,
-        h: torch.Tensor,
-        r: torch.Tensor,
-        t: torch.Tensor,
-    ) -> SizeInformation:
-        """Extract size information from tensors."""
-        bh, nh = h.shape[:2]
-        br, nr = r.shape[:2]
-        bt, nt = t.shape[:2]
-        return cls(bh=bh, nh=nh, br=br, nr=nr, bt=bt, nt=nt)
 
 
 def _extract_sizes(
@@ -320,6 +276,29 @@ def distmult_interaction(
     return tensor_product(h, r, t).sum(dim=-1)
 
 
+def dist_ma_interaction(
+    h: torch.FloatTensor,
+    r: torch.FloatTensor,
+    t: torch.FloatTensor,
+) -> torch.FloatTensor:
+    r"""Evaluate the DistMA interaction function from [shi2019]_.
+
+    .. math ::
+        \langle h, r\rangle + \langle r, t\rangle + \langle h, t\rangle
+
+    :param h: shape: (batch_size, num_heads, 1, 1, dim)
+        The head representations.
+    :param r: shape: (batch_size, 1, num_relations, 1, dim)
+        The relation representations.
+    :param t: shape: (batch_size, 1, 1, num_tails, dim)
+        The tail representations.
+
+    :return: shape: (batch_size, num_heads, num_relations, num_tails)
+        The scores.
+    """
+    return batched_dot(h, r) + batched_dot(r, t) + batched_dot(h, t)
+
+
 def ermlp_interaction(
     h: torch.FloatTensor,
     r: torch.FloatTensor,
@@ -346,13 +325,11 @@ def ermlp_interaction(
     :return: shape: (batch_size, num_heads, num_relations, num_tails)
         The scores.
     """
-    sizes = SizeInformation.extract(h, r, t)
-
     # same shape
-    if sizes.same:
+    if h.shape == r.shape and h.shape == t.shape:
         return final(activation(
             hidden(torch.cat([h, r, t], dim=-1).view(-1, 3 * h.shape[-1]))),
-        ).view(sizes.bh, sizes.nh, sizes.nr, sizes.nt)
+        ).view(*h.shape[:-1])
 
     hidden_dim = hidden.weight.shape[0]
     # split, shape: (embedding_dim, hidden_dim)
@@ -415,24 +392,43 @@ def hole_interaction(
     :return: shape: (batch_size, num_heads, num_relations, num_tails)
         The scores.
     """
-    # Circular correlation of entity embeddings
-    a_fft = rfft(h, dim=-1)
-    b_fft = rfft(t, dim=-1)
-
-    # complex conjugate
-    a_fft = torch.conj(a_fft)
-
-    # Hadamard product in frequency domain
-    p_fft = a_fft * b_fft
-
-    # inverse real FFT, shape: (b, h, 1, t, d)
-    composite = irfft(p_fft, n=h.shape[-1], dim=-1)
+    # composite: (b, h, 1, t, d)
+    composite = circular_correlation(h, t)
 
     # transpose composite: (b, h, 1, d, t)
     composite = composite.transpose(-2, -1)
 
     # inner product with relation embedding
     return (r @ composite).squeeze(dim=-2)
+
+
+def circular_correlation(
+    a: torch.FloatTensor,
+    b: torch.FloatTensor,
+) -> torch.FloatTensor:
+    """
+    Compute the circular correlation between to vectors.
+
+    .. note ::
+        The implementation uses FFT.
+
+    :param a: shape: s_1
+        The tensor with the first vectors.
+    :param b:
+        The tensor with the second vectors.
+
+    :return:
+        The circular correlation between the vectors.
+    """
+    # Circular correlation of entity embeddings
+    a_fft = rfft(a, dim=-1)
+    b_fft = rfft(b, dim=-1)
+    # complex conjugate
+    a_fft = torch.conj(a_fft)
+    # Hadamard product in frequency domain
+    p_fft = a_fft * b_fft
+    # inverse real FFT
+    return irfft(p_fft, n=a.shape[-1], dim=-1)
 
 
 def kg2e_interaction(
@@ -697,6 +693,38 @@ def structured_embedding_interaction(
     )
 
 
+def toruse_interaction(
+    h: torch.FloatTensor,
+    r: torch.FloatTensor,
+    t: torch.FloatTensor,
+    p: Union[int, str] = 2,
+    power_norm: bool = False,
+) -> torch.FloatTensor:
+    """Evaluate the TorusE interaction function from [ebisu2018].
+
+    .. note ::
+        This only implements the two L_p norm based variants.
+
+    :param h: shape: (batch_size, num_heads, 1, 1, dim)
+        The head representations.
+    :param r: shape: (batch_size, 1, num_relations, 1, dim)
+        The relation representations.
+    :param t: shape: (batch_size, 1, 1, num_tails, dim)
+        The tail representations.
+    :param p:
+        The p for the norm.
+    :param power_norm:
+        Whether to return the powered norm.
+
+    :return: shape: (batch_size, num_heads, num_relations, num_tails)
+        The scores.
+    """
+    d = tensor_sum(h, r, -t)
+    d = d - torch.floor(d)
+    d = torch.minimum(d, 1.0 - d)
+    return negative_norm(d, p=p, power_norm=power_norm)
+
+
 def transd_interaction(
     h: torch.FloatTensor,
     r: torch.FloatTensor,
@@ -767,6 +795,26 @@ def transe_interaction(
         The scores.
     """
     return negative_norm_of_sum(h, r, -t, p=p, power_norm=power_norm)
+
+
+def transf_interaction(
+    h: torch.FloatTensor,
+    r: torch.FloatTensor,
+    t: torch.FloatTensor,
+) -> torch.FloatTensor:
+    """Evaluate the TransF interaction function.
+
+    :param h: shape: (batch_size, num_heads, 1, 1, dim)
+        The head representations.
+    :param r: shape: (batch_size, 1, num_relations, 1, dim)
+        The relation representations.
+    :param t: shape: (batch_size, 1, 1, num_tails, dim)
+        The tail representations.
+
+    :return: shape: (batch_size, num_heads, num_relations, num_tails)
+        The scores.
+    """
+    return batched_dot(h + r, t) + batched_dot(h, t - r)
 
 
 def transh_interaction(
@@ -1014,3 +1062,111 @@ def pair_re_interaction(
         p=p,
         power_norm=power_norm,
     )
+
+
+def _rotate_quaternion(qa: torch.FloatTensor, qb: torch.FloatTensor) -> torch.FloatTensor:
+    # Rotate (=Hamilton product in quaternion space).
+    return torch.cat(
+        [
+            qa[0] * qb[0] - qa[1] * qb[1] - qa[2] * qb[2] - qa[3] * qb[3],
+            qa[0] * qb[1] + qa[1] * qb[0] + qa[2] * qb[3] - qa[3] * qb[2],
+            qa[0] * qb[2] - qa[1] * qb[3] + qa[2] * qb[0] + qa[3] * qb[1],
+            qa[0] * qb[3] + qa[1] * qb[2] - qa[2] * qb[1] + qa[3] * qb[0],
+        ],
+        dim=-1,
+    )
+
+
+def _split_quaternion(x: torch.FloatTensor) -> torch.FloatTensor:
+    return torch.chunk(x, chunks=4, dim=-1)
+
+
+def quat_e_interaction(
+    h: torch.FloatTensor,
+    r: torch.FloatTensor,
+    t: torch.FloatTensor,
+):
+    """Evaluate the interaction function of QuatE for given embeddings.
+
+    The embeddings have to be in a broadcastable shape.
+
+    .. note ::
+        dim has to be divisible by 4.
+
+    :param h: shape: (batch_size, num_heads, 1, 1, dim)
+        The head representations.
+    :param r: shape: (batch_size, 1, num_relations, 1, dim)
+        The head representations.
+    :param t: shape: (batch_size, 1, 1, num_tails, dim)
+        The tail representations.
+
+    :return: shape: (...)
+        The scores.
+    """
+    return -(
+        # Rotation in quaternion space
+        _rotate_quaternion(
+            _split_quaternion(h),
+            _split_quaternion(r),
+        ) * t
+    ).sum(dim=-1)
+
+
+def cross_e_interaction(
+    h: torch.FloatTensor,
+    r: torch.FloatTensor,
+    c_r: torch.FloatTensor,
+    t: torch.FloatTensor,
+    bias: torch.FloatTensor,
+    activation: nn.Module,
+    dropout: Optional[nn.Dropout] = None,
+) -> torch.FloatTensor:
+    r"""
+    Evaluate the interaction function of CrossE for the given representations from [zhang2019b]_.
+
+    .. math ::
+        Dropout(Activation(c_r \odot h + c_r \odot h \odot r + b))^T t)
+
+    .. note ::
+        The representations have to be in a broadcastable shape.
+
+    .. note ::
+        The CrossE paper described an additional sigmoid activation as part of the interaction function. Since using a
+        log-likelihood loss can cause numerical problems (due to explicitly calling sigmoid before log), we do not
+        apply this in our implementation but rather opt for the numerically stable variant. However, the model itself
+        has an option ``predict_with_sigmoid``, which can be used to enforce application of sigmoid during inference.
+        This can also have an impact of rank-based evaluation, since limited numerical precision can lead to exactly
+        equal scores for multiple choices. The definition of a rank is not unambiguous in such case, and there exist
+        multiple competing variants how to break the ties. More information on this can be found in the documentation of
+        rank-based evaluation.
+
+    :param h: shape: (batch_size, num_heads, 1, 1, dim)
+        The head representations.
+    :param r: shape: (batch_size, 1, num_relations, 1, dim)
+        The relation representations.
+    :param c_r: shape: (batch_size, 1, num_relations, 1, dim)
+        The relation-specific interaction vector.
+    :param t: shape: (batch_size, 1, 1, num_tails, dim)
+        The tail representations.
+    :param bias: shape: (1, 1, 1, 1, dim)
+        The combination bias.
+    :param activation:
+        The combination activation. Should be :class:`torch.nn.Tanh` for consistency with the CrossE paper.
+    :param dropout:
+        Dropout applied after the combination.
+
+    :return: shape: (batch_size, num_heads, num_relations, num_tails)
+        The scores.
+
+    .. seealso:: https://github.com/wencolani/CrossE
+    """
+    # head interaction
+    h = c_r * h
+    # relation interaction (notice that h has been updated)
+    r = h * r
+    # combination
+    x = activation(h + r + bias)
+    if dropout is not None:
+        x = dropout(x)
+    # similarity
+    return (x * t).sum(dim=-1)

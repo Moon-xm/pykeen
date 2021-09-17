@@ -15,14 +15,18 @@ from class_resolver import Resolver
 from torch import FloatTensor, nn
 
 from . import functional as pkf
-from ..typing import HeadRepresentation, RelationRepresentation, TailRepresentation
-from ..utils import CANONICAL_DIMENSIONS, convert_to_canonical_shape, ensure_tuple, upgrade_to_sequence
+from .combinations import Combination
+from ..typing import HeadRepresentation, HintOrType, RelationRepresentation, TailRepresentation
+from ..utils import (
+    CANONICAL_DIMENSIONS, activation_resolver, convert_to_canonical_shape, ensure_tuple, upgrade_to_sequence,
+)
 
 __all__ = [
     'interaction_resolver',
     # Base Classes
     'Interaction',
     'FunctionalInteraction',
+    'LiteralInteraction',
     'TranslationalInteraction',
     # Adapter classes
     'MonotonicAffineTransformationInteraction',
@@ -30,7 +34,9 @@ __all__ = [
     'ComplExInteraction',
     'ConvEInteraction',
     'ConvKBInteraction',
+    'CrossEInteraction',
     'DistMultInteraction',
+    'DistMAInteraction',
     'ERMLPInteraction',
     'ERMLPEInteraction',
     'HolEInteraction',
@@ -43,8 +49,10 @@ __all__ = [
     'RotatEInteraction',
     'SimplEInteraction',
     'StructuredEmbeddingInteraction',
+    'TorusEInteraction',
     'TransDInteraction',
     'TransEInteraction',
+    'TransFInteraction',
     'TransHInteraction',
     'TransRInteraction',
     'TuckerInteraction',
@@ -326,6 +334,60 @@ class Interaction(nn.Module, Generic[HeadRepresentation, RelationRepresentation,
                 mod.reset_parameters()
 
 
+class LiteralInteraction(
+    Interaction,
+    Generic[HeadRepresentation, RelationRepresentation, TailRepresentation],
+):
+    """The interaction function shared by literal-containing interactions."""
+
+    def __init__(
+        self,
+        base: HintOrType[Interaction[HeadRepresentation, RelationRepresentation, TailRepresentation]],
+        combination: Combination,
+        base_kwargs: Optional[Mapping[str, Any]] = None,
+    ):
+        """Instantiate the module.
+
+        :param combination: The module used to concatenate the literals to the entity representations
+        :param base: The interaction module
+        :param base_kwargs: Keyword arguments for the interaction module
+        """
+        super().__init__()
+        self.base = interaction_resolver.make(base, base_kwargs)
+        self.combination = combination
+        # The appended "e" represents the literals that get concatenated
+        # on the entity representations. It does not necessarily have the
+        # same dimension "d" as the entity representations.
+        self.entity_shape = tuple(self.base.entity_shape) + ("e",)
+
+    def forward(
+        self,
+        h: HeadRepresentation,
+        r: RelationRepresentation,
+        t: TailRepresentation,
+    ) -> torch.FloatTensor:
+        """Compute broadcasted triple scores given broadcasted representations for head, relation and tails.
+
+        :param h: shape: (batch_size, num_heads, 1, 1, ``*``)
+            The head representations.
+        :param r: shape: (batch_size, 1, num_relations, 1, ``*``)
+            The relation representations.
+        :param t: shape: (batch_size, 1, 1, num_tails, ``*``)
+            The tail representations.
+
+        :return: shape: (batch_size, num_heads, num_relations, num_tails)
+            The scores.
+        """
+        # alternate way of combining entity embeddings + literals
+        # h = torch.cat(h, dim=-1)
+        # h = self.combination(h.view(-1, h.shape[-1])).view(*h.shape[:-1], -1)  # type: ignore
+        # t = torch.cat(t, dim=-1)
+        # t = self.combination(t.view(-1, t.shape[-1])).view(*t.shape[:-1], -1)  # type: ignore
+        h_proj = self.combination(*h)
+        t_proj = self.combination(*t)
+        return self.base(h=h_proj, r=r, t=t_proj)
+
+
 class FunctionalInteraction(Interaction, Generic[HeadRepresentation, RelationRepresentation, TailRepresentation]):
     """Base class for interaction functions."""
 
@@ -409,6 +471,15 @@ class TransEInteraction(TranslationalInteraction[FloatTensor, FloatTensor, Float
     """
 
     func = pkf.transe_interaction
+
+
+class TransFInteraction(FunctionalInteraction[FloatTensor, FloatTensor, FloatTensor]):
+    """A stateless module for the TransF interaction function.
+
+    .. seealso:: :func:`pykeen.nn.functional.transf_interaction`
+    """
+
+    func = pkf.transf_interaction
 
 
 class ComplExInteraction(FunctionalInteraction[FloatTensor, FloatTensor, FloatTensor]):
@@ -639,6 +710,15 @@ class DistMultInteraction(FunctionalInteraction[FloatTensor, FloatTensor, FloatT
     """
 
     func = pkf.distmult_interaction
+
+
+class DistMAInteraction(FunctionalInteraction[FloatTensor, FloatTensor, FloatTensor]):
+    """A module wrapper for the stateless DistMA interaction function.
+
+    .. seealso:: :func:`pykeen.nn.functional.dist_ma_interaction`
+    """
+
+    func = pkf.dist_ma_interaction
 
 
 class ERMLPInteraction(FunctionalInteraction[FloatTensor, FloatTensor, FloatTensor]):
@@ -940,6 +1020,18 @@ class UnstructuredModelInteraction(
         return dict(h=h, t=t)
 
 
+class TorusEInteraction(TranslationalInteraction[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]):
+    """A stateful module for the TorusE interaction function.
+
+    .. seealso:: :func:`pykeen.nn.functional.toruse_interaction`
+    """
+
+    func = pkf.toruse_interaction
+
+    def __init__(self, p: int = 2, power_norm: bool = False):
+        super().__init__(p=p, power_norm=power_norm)
+
+
 class TransDInteraction(
     TranslationalInteraction[
         Tuple[torch.FloatTensor, torch.FloatTensor],
@@ -986,11 +1078,24 @@ class NTNInteraction(
     relation_shape = ("kdd", "kd", "kd", "k", "k")
     func = pkf.ntn_interaction
 
-    def __init__(self, non_linearity: Optional[nn.Module] = None):
+    def __init__(
+        self,
+        activation: HintOrType[nn.Module] = None,
+        activation_kwargs: Optional[Mapping[str, Any]] = None,
+    ):
+        """Initialize NTN with the given non-linear activation function.
+
+        :param activation: A non-linear activation function. Defaults to the hyperbolic
+            tangent :class:`torch.nn.Tanh` if none, otherwise uses the :data:`pykeen.utils.activation_resolver`
+            for lookup.
+        :param activation_kwargs: If the ``activation`` is passed as a class, these keyword arguments
+            are used during its instantiation.
+        """
         super().__init__()
-        if non_linearity is None:
-            non_linearity = nn.Tanh()
-        self.non_linearity = non_linearity
+        if activation is None:
+            self.non_linearity = nn.Tanh()
+        else:
+            self.non_linearity = activation_resolver.make(activation, activation_kwargs)
 
     @staticmethod
     def _prepare_hrt_for_functional(
@@ -1154,6 +1259,21 @@ class PairREInteraction(TranslationalInteraction[FloatTensor, Tuple[FloatTensor,
         return dict(h=h, r_h=r[0], r_t=r[1], t=t)
 
 
+class QuatEInteraction(
+    FunctionalInteraction[
+        torch.FloatTensor,
+        torch.FloatTensor,
+        torch.FloatTensor,
+    ],
+):
+    """A module wrapper for the QuatE interaction function.
+
+    .. seealso:: :func:`pykeen.nn.functional.quat_e_interaction`
+    """
+
+    func = pkf.quat_e_interaction
+
+
 class MonotonicAffineTransformationInteraction(
     Interaction[
         HeadRepresentation,
@@ -1235,6 +1355,60 @@ class MonotonicAffineTransformationInteraction(
         t: TailRepresentation,
     ) -> torch.FloatTensor:  # noqa: D102
         return self.log_scale.exp() * self.base(h=h, r=r, t=t) + self.bias
+
+
+class CrossEInteraction(FunctionalInteraction[FloatTensor, Tuple[FloatTensor, FloatTensor], FloatTensor]):
+    """A module wrapper for the CrossE interaction function.
+
+    .. seealso:: :func:`pykeen.nn.functional.cross_e_interaction`
+    """
+
+    func = pkf.cross_e_interaction
+    relation_shape = ("d", "d")
+
+    def __init__(
+        self,
+        embedding_dim: int = 50,
+        combination_activation: HintOrType[nn.Module] = nn.Tanh,
+        combination_activation_kwargs: Optional[Mapping[str, Any]] = None,
+        combination_dropout: Optional[float] = 0.5,
+    ):
+        """
+        Instantiate the interaction module.
+
+        :param embedding_dim:
+            The embedding dimension.
+        :param combination_activation:
+            The combination activation function.
+        :param combination_activation_kwargs:
+            Additional keyword-based arguments passed to the constructor of the combination activation function (if
+            not already instantiated).
+        :param combination_dropout:
+            An optional dropout applied to the combination.
+        """
+        super().__init__()
+        self.combination_activation = activation_resolver.make(
+            combination_activation,
+            pos_kwargs=combination_activation_kwargs,
+        )
+        self.combination_bias = nn.Parameter(data=torch.zeros(1, 1, 1, 1, embedding_dim))
+        self.combination_dropout = nn.Dropout(combination_dropout) if combination_dropout else None
+
+    def _prepare_state_for_functional(self) -> MutableMapping[str, Any]:  # noqa: D102
+        return dict(
+            bias=self.combination_bias,
+            activation=self.combination_activation,
+            dropout=self.combination_dropout,
+        )
+
+    @staticmethod
+    def _prepare_hrt_for_functional(
+        h: FloatTensor,
+        r: Tuple[FloatTensor, FloatTensor],
+        t: FloatTensor,
+    ) -> MutableMapping[str, torch.FloatTensor]:  # noqa: D102
+        r, c_r = r
+        return dict(h=h, r=r, c_r=c_r, t=t)
 
 
 interaction_resolver = Resolver.from_subclasses(

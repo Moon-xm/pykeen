@@ -15,20 +15,21 @@ later, but that will cause problems - the code will get executed twice:
 
 import inspect
 import os
-import platform
 import sys
+from pathlib import Path
 from typing import Optional
 
 import click
 from click_default_group import DefaultGroup
 from tabulate import tabulate
 
-from .datasets import datasets as datasets_dict
+from .datasets import dataset_resolver
 from .evaluation import evaluator_resolver, get_metric_list, metric_resolver
 from .experiments.cli import experiments
 from .hpo.cli import optimize
 from .hpo.samplers import sampler_resolver
 from .losses import loss_resolver
+from .lr_schedulers import lr_scheduler_resolver
 from .models import model_resolver
 from .models.cli import build_cli_from_cls
 from .optimizers import optimizer_resolver
@@ -39,9 +40,9 @@ from .trackers import tracker_resolver
 from .training import training_loop_resolver
 from .triples.utils import EXTENSION_IMPORTERS, PREFIX_IMPORTERS
 from .utils import get_until_first_blank
-from .version import get_version
+from .version import env_table
 
-HERE = os.path.abspath(os.path.dirname(__file__))
+HERE = Path(__file__).resolve().parent
 
 
 @click.group()
@@ -50,21 +51,10 @@ def main():
 
 
 @main.command()
-def version():
+@click.option('-f', '--tablefmt', default='github', show_default=True)
+def version(tablefmt):
     """Print version information for debugging."""
-    import torch
-    t1 = [
-        ('`os.name`', os.name),
-        ('`platform.system()`', platform.system()),
-        ('`platform.release()`', platform.release()),
-        ('python', f'{sys.version_info[0]}.{sys.version_info[1]}.{sys.version_info[2]}'),
-        ('pykeen', get_version(with_git_hash=True)),
-        ('torch', torch.__version__),
-        ('cuda available', str(torch.cuda.is_available()).lower()),
-        ('cuda', torch.version.cuda),
-        ('cudnn', torch.backends.cudnn.version()),
-    ]
-    click.echo(tabulate(t1, tablefmt='github', headers=['Key', 'Value']))
+    click.echo(env_table(tablefmt))
 
 
 tablefmt_option = click.option('-f', '--tablefmt', default='plain', show_default=True)
@@ -101,9 +91,10 @@ def _get_model_lines(tablefmt: str, link_fmt: Optional[str] = None):
                 reference = f'[`{reference}`]({link_fmt.format(reference)})'
             else:
                 reference = f'`{reference}`'
+            name = docdata.get('name', model.__name__)
             citation = docdata['citation']
             citation_str = f"[{citation['author']} *et al.*, {citation['year']}]({citation['link']})"
-            yield model.__name__, reference, citation_str
+            yield name, reference, citation_str
         else:
             line = str(model.__doc__.splitlines()[0])
             l, r = line.find('['), line.find(']')
@@ -201,8 +192,8 @@ def evaluators(tablefmt: str):
     click.echo(_help_evaluators(tablefmt))
 
 
-def _help_evaluators(tablefmt):
-    lines = sorted(_get_lines(evaluator_resolver.lookup_dict, tablefmt, 'evaluation'))
+def _help_evaluators(tablefmt, link_fmt: Optional[str] = None):
+    lines = sorted(_get_lines(evaluator_resolver.lookup_dict, tablefmt, 'evaluation', link_fmt=link_fmt))
     return tabulate(
         lines,
         headers=['Name', 'Description'] if tablefmt == 'plain' else ['Name', 'Reference', 'Description'],
@@ -247,6 +238,25 @@ def _help_optimizers(tablefmt: str, link_fmt: Optional[str] = None):
 
 @ls.command()
 @tablefmt_option
+def lr_schedulers(tablefmt: str):
+    """List optimizers."""
+    click.echo(_help_lr_schedulers(tablefmt))
+
+
+def _help_lr_schedulers(tablefmt: str, link_fmt: Optional[str] = None):
+    lines = _get_lines_alternative(
+        tablefmt, lr_scheduler_resolver.lookup_dict, 'torch.optim.lr_scheduler', 'pykeen.lr_schedulers',
+        link_fmt=link_fmt,
+    )
+    return tabulate(
+        lines,
+        headers=['Name', 'Reference', 'Description'],
+        tablefmt=tablefmt,
+    )
+
+
+@ls.command()
+@tablefmt_option
 def regularizers(tablefmt: str):
     """List regularizers."""
     click.echo(_help_regularizers(tablefmt))
@@ -262,19 +272,23 @@ def _help_regularizers(tablefmt, link_fmt: Optional[str] = None):
 
 
 def _get_lines_alternative(tablefmt, d, torch_prefix, pykeen_prefix, link_fmt: Optional[str] = None):
-    for name, submodule in sorted(d.items()):
+    for name, cls in sorted(d.items()):
         if any(
-            submodule.__module__.startswith(_prefix)
+            cls.__module__.startswith(_prefix)
             for _prefix in ('torch', 'optuna')
         ):
-            path = f'{torch_prefix}.{submodule.__qualname__}'
+            path = f'{torch_prefix}.{cls.__qualname__}'
         else:  # from pykeen
-            path = f'{pykeen_prefix}.{submodule.__qualname__}'
+            path = f'{pykeen_prefix}.{cls.__qualname__}'
+
+        docdata = getattr(cls, '__docdata__', None)
+        if docdata is not None:
+            name = docdata.get('name', name)
 
         if tablefmt == 'rst':
             yield name, f':class:`{path}`'
         elif tablefmt == 'github':
-            doc = submodule.__doc__
+            doc = cls.__doc__
             if link_fmt:
                 reference = f'[`{path}`]({link_fmt.format(path)})'
             else:
@@ -282,7 +296,7 @@ def _get_lines_alternative(tablefmt, d, torch_prefix, pykeen_prefix, link_fmt: O
 
             yield name, reference, get_until_first_blank(doc)
         else:
-            doc = submodule.__doc__
+            doc = cls.__doc__
             yield name, path, get_until_first_blank(doc)
 
 
@@ -293,10 +307,14 @@ def metrics(tablefmt: str):
     click.echo(_help_metrics(tablefmt))
 
 
-def _help_metrics(tablefmt):
+def _help_metrics(tablefmt, link_fmt=None):
     return tabulate(
-        sorted(_get_metrics_lines(tablefmt)),
-        headers=['Name', 'Reference'] if tablefmt == 'rst' else ['Metric', 'Description', 'Evaluator', 'Reference'],
+        sorted(_get_metrics_lines(tablefmt, link_fmt=link_fmt)),
+        headers=(
+            ['Name', 'Reference'] if tablefmt == 'rst'
+            else ['Name', 'Description'] if tablefmt == 'github'
+            else ['Metric', 'Description', 'Reference']
+        ),
         tablefmt=tablefmt,
     )
 
@@ -335,19 +353,18 @@ def _help_hpo_samplers(tablefmt: str, link_fmt: Optional[str] = None):
     )
 
 
-def _get_metrics_lines(tablefmt: str):
+def _get_metrics_lines(tablefmt: str, link_fmt=None):
     if tablefmt == 'rst':
         for name, value in metric_resolver.lookup_dict.items():
             yield name, f':class:`pykeen.evaluation.{value.__name__}`'
     else:
         for field, name, value in get_metric_list():
+            if field.name in {'rank_std', 'rank_var', 'rank_mad'}:
+                continue
             if tablefmt == 'github':
-                yield (
-                    field.name.replace('_', ' ').title(), field.metadata['doc'],
-                    name, f'`pykeen.evaluation.{value.__name__}`',
-                )
+                yield field.metadata['name'], field.metadata['doc']
             else:
-                yield field.name, field.metadata['doc'], name, f'pykeen.evaluation.{value.__name__}'
+                yield field.metadata['name'], field.metadata['doc'], name, f'pykeen.evaluation.{value.__name__}'
 
 
 def _get_lines(d, tablefmt, submodule, link_fmt: Optional[str] = None):
@@ -379,7 +396,7 @@ def _get_lines(d, tablefmt, submodule, link_fmt: Optional[str] = None):
 
 
 def _get_dataset_lines(tablefmt, link_fmt: Optional[str] = None):
-    for name, value in sorted(datasets_dict.items()):
+    for name, value in sorted(dataset_resolver.lookup_dict.items()):
         reference = f'pykeen.datasets.{value.__name__}'
         if tablefmt == 'rst':
             reference = f':class:`{reference}`'
@@ -452,7 +469,7 @@ def readme(check: bool):
 def get_readme() -> str:
     """Get the readme."""
     from jinja2 import FileSystemLoader, Environment
-    loader = FileSystemLoader(os.path.join(HERE, 'templates'))
+    loader = FileSystemLoader(HERE.joinpath('templates'))
     environment = Environment(
         autoescape=True,
         loader=loader,
@@ -468,7 +485,7 @@ def get_readme() -> str:
         losses=_help_losses(tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/api/{}.html'),
         n_losses=len(loss_resolver.lookup_dict),
         datasets=_help_datasets(tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/api/{}.html'),
-        n_datasets=len(datasets_dict),
+        n_datasets=len(dataset_resolver.lookup_dict),
         training_loops=_help_training(
             tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/reference/training.html#{}',
         ),
@@ -483,9 +500,9 @@ def get_readme() -> str:
             tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/reference/stoppers.html#{}',
         ),
         n_stoppers=len(stopper_resolver.lookup_dict),
-        evaluators=_help_evaluators(tablefmt),
+        evaluators=_help_evaluators(tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/api/{}.html'),
         n_evaluators=len(evaluator_resolver.lookup_dict),
-        metrics=_help_metrics(tablefmt),
+        metrics=_help_metrics(tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/api/{}.html'),
         n_metrics=len(get_metric_list()),
         trackers=_help_trackers(tablefmt, link_fmt='https://pykeen.readthedocs.io/en/latest/api/{}.html'),
         n_trackers=len(tracker_resolver.lookup_dict),

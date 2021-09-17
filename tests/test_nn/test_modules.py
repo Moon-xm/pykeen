@@ -3,16 +3,17 @@
 """Tests for interaction functions."""
 
 import logging
-from typing import Tuple
+from typing import Tuple, Union
 from unittest import SkipTest
 
 import numpy
 import torch
+import unittest_templates
 
 import pykeen.nn.modules
 import pykeen.utils
-from pykeen.nn.functional import distmult_interaction
-from pykeen.nn.modules import FunctionalInteraction, Interaction, TranslationalInteraction
+from pykeen.nn.functional import _rotate_quaternion, _split_quaternion, distmult_interaction
+from pykeen.nn.modules import FunctionalInteraction, Interaction, LiteralInteraction, TranslationalInteraction
 from pykeen.utils import clamp_norm, project_entity, strip_dim, view_complex
 from tests import cases
 
@@ -80,6 +81,19 @@ class ConvKBTests(cases.InteractionTestCase):
         return linear(x.view(1, -1))
 
 
+class CrossETests(cases.InteractionTestCase):
+    """Tests for CrossE interaction function."""
+
+    cls = pykeen.nn.modules.CrossEInteraction
+    kwargs = dict(
+        embedding_dim=cases.InteractionTestCase.dim,
+    )
+
+    def _exp_score(self, h, r, c_r, t, bias, activation, dropout) -> torch.FloatTensor:  # noqa: D102
+        h, r, c_r, t, bias = strip_dim(h, r, c_r, t, bias)
+        return (dropout(activation(h * c_r + h * r * c_r + bias)) * t).sum()
+
+
 class DistMultTests(cases.InteractionTestCase):
     """Tests for DistMult interaction function."""
 
@@ -87,6 +101,15 @@ class DistMultTests(cases.InteractionTestCase):
 
     def _exp_score(self, h, r, t) -> torch.FloatTensor:
         return (h * r * t).sum(dim=-1)
+
+
+class DistMATests(cases.InteractionTestCase):
+    """Tests for DistMA interaction function."""
+
+    cls = pykeen.nn.modules.DistMAInteraction
+
+    def _exp_score(self, h, r, t) -> torch.FloatTensor:
+        return (h * r).sum() + (r * t).sum() + (h * t).sum()
 
 
 class ERMLPTests(cases.InteractionTestCase):
@@ -165,6 +188,17 @@ class ProjETests(cases.InteractionTestCase):
         # f(h, r, t) = g(t z(D_e h + D_r r + b_c) + b_p)
         h, r, t = strip_dim(h, r, t)
         return (t * activation((d_e * h) + (d_r * r) + b_c)).sum() + b_p
+
+
+class QuatETests(cases.InteractionTestCase):
+    """Tests for QuatE interaction."""
+
+    cls = pykeen.nn.modules.QuatEInteraction
+    dim = 4 * cases.InteractionTestCase.dim  # quaternions
+
+    def _exp_score(self, h, r, t) -> torch.FloatTensor:  # noqa: D102
+        h, r, t = strip_dim(h, r, t)
+        return -(_rotate_quaternion(*(_split_quaternion(x) for x in [h, r])) * t).sum()
 
 
 class RESCALTests(cases.InteractionTestCase):
@@ -391,6 +425,42 @@ class MuRETests(cases.TranslationalInteractionTests):
         pass
 
 
+class TorusETests(cases.TranslationalInteractionTests):
+    """Tests for the TorusE interaction function."""
+
+    cls = pykeen.nn.modules.TorusEInteraction
+
+    def _exp_score(
+        self,
+        h: torch.FloatTensor,
+        r: torch.FloatTensor,
+        t: torch.FloatTensor,
+        p: Union[int, str] = 2,
+        power_norm: bool = False,
+    ) -> torch.FloatTensor:
+        assert not power_norm
+        d = (h + r - t)
+        d = d - torch.floor(d)
+        d = torch.minimum(d, 1.0 - d)
+        return -d.norm(p=p)
+
+
+class TransFTests(cases.InteractionTestCase):
+    """Tests for the TransF interaction function."""
+
+    cls = pykeen.nn.modules.TransFInteraction
+
+    def _exp_score(
+        self,
+        h: torch.FloatTensor,
+        r: torch.FloatTensor,
+        t: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        left = ((h + r) * t).sum(dim=-1)
+        right = (h * (t - r)).sum(dim=-1)
+        return left + right
+
+
 class MonotonicAffineTransformationInteractionTests(cases.InteractionTestCase):
     """Tests for monotonic affine transformation interaction adapter."""
 
@@ -398,9 +468,6 @@ class MonotonicAffineTransformationInteractionTests(cases.InteractionTestCase):
     kwargs = dict(
         base=pykeen.nn.modules.TransEInteraction(p=2),
     )
-
-    def test_forward_consistency_with_functional(self):  # noqa: D102
-        raise SkipTest("Not a functional interaction.")
 
     def test_scores(self):  # noqa: D102
         raise SkipTest("Not a functional interaction.")
@@ -421,7 +488,7 @@ class MonotonicAffineTransformationInteractionTests(cases.InteractionTestCase):
             assert (c_t == c_o).all()
 
 
-class InteractionTestsTestCase(cases.TestsTestCase[Interaction]):
+class InteractionTestsTestCase(unittest_templates.MetaTestCase[Interaction]):
     """Test for tests for all interaction functions."""
 
     base_cls = Interaction
@@ -430,5 +497,5 @@ class InteractionTestsTestCase(cases.TestsTestCase[Interaction]):
         Interaction,
         FunctionalInteraction,
         TranslationalInteraction,
-        # LiteralInteraction,
+        LiteralInteraction,
     }
